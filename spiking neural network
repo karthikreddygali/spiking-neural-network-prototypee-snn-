@@ -1,0 +1,225 @@
+import serial
+import serial.tools.list_ports
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import numpy as np
+from collections import deque
+
+# -------- SETTINGS --------
+SERIAL_PORT = "COM9"  # Change to your Arduino COM port
+BAUD_RATE = 115200
+
+NUM_NEURONS = 50
+NUM_SENSORS = 3
+THRESHOLD = 5
+MAX_SAMPLES = 100
+
+# -------- SERIAL CONNECTION --------
+print("Available serial ports:")
+for port in serial.tools.list_ports.comports():
+    print(port.device, "-", port.description)
+
+try:
+    arduino = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+    arduino.reset_input_buffer()
+    print("Connected to Arduino on", SERIAL_PORT)
+except serial.SerialException as error:
+    print("Could not open serial port:", error)
+    print("Check SERIAL_PORT and close Arduino Serial Monitor.")
+    raise SystemExit
+
+# -------- DATA STORAGE --------
+sensor_history = deque(maxlen=MAX_SAMPLES)
+class_history = deque(maxlen=MAX_SAMPLES)
+spike_count_history = deque(maxlen=MAX_SAMPLES)
+membrane_history = deque(maxlen=MAX_SAMPLES)
+
+# Each entry stores neuron numbers that spiked in that sample.
+raster_history = deque(maxlen=MAX_SAMPLES)
+
+previous_membrane = np.zeros(NUM_NEURONS, dtype=int)
+sample_number = 0
+
+# -------- CREATE FIVE GRAPHS --------
+fig, axes = plt.subplots(3, 2, figsize=(13, 9))
+fig.suptitle("50-Neuron SNN Dashboard")
+
+ax_sensor = axes[0, 0]
+ax_heat = axes[0, 1]
+ax_class = axes[1, 0]
+ax_count = axes[1, 1]
+ax_raster = axes[2, 0]
+axes[2, 1].axis("off")
+
+# Sensor graph
+sensor_bars = ax_sensor.bar(
+    ["Sensor 1", "Sensor 2", "Sensor 3"], [0, 0, 0]
+)
+ax_sensor.set_title("IR Sensor States")
+ax_sensor.set_ylim(0, 1.2)
+ax_sensor.set_ylabel("0 = inactive, 1 = active")
+
+# Membrane heatmap
+heat_image = ax_heat.imshow(
+    np.zeros((NUM_NEURONS, MAX_SAMPLES)),
+    aspect="auto",
+    origin="lower",
+    vmin=0,
+    vmax=THRESHOLD,
+    cmap="viridis"
+)
+ax_heat.set_title("50 Neuron Membrane Values")
+ax_heat.set_xlabel("Recent sample")
+ax_heat.set_ylabel("Neuron index (1–50)")
+fig.colorbar(heat_image, ax=ax_heat, label="Membrane value")
+
+# Input class graph
+class_line, = ax_class.plot([], [], ".-")
+ax_class.set_title("Input Pattern Class")
+ax_class.set_xlabel("Recent sample")
+ax_class.set_ylabel("Class (0–7)")
+ax_class.set_ylim(-0.5, 7.5)
+
+# Cumulative spike graph
+count_line, = ax_count.plot([], [], ".-")
+ax_count.set_title("Total Neuron Spikes")
+ax_count.set_xlabel("Recent sample")
+ax_count.set_ylabel("Cumulative spike count")
+
+# Spike raster plot
+raster_points = ax_raster.scatter([], [], s=12)
+ax_raster.set_title("Neuron Spike Activity (Raster Plot)")
+ax_raster.set_xlabel("Sample number")
+ax_raster.set_ylabel("Neuron number")
+ax_raster.set_ylim(0.5, NUM_NEURONS + 0.5)
+ax_raster.set_yticks([1, 10, 20, 30, 40, 50])
+ax_raster.grid(True, alpha=0.3)
+
+# -------- UPDATE FUNCTION --------
+def update(frame):
+    global previous_membrane, sample_number
+
+    # Read available serial lines
+    while arduino.in_waiting:
+        try:
+            line = arduino.readline().decode(
+                "utf-8", errors="ignore"
+            ).strip()
+
+            if not line:
+                continue
+
+            values = [int(v) for v in line.split(",")]
+
+            # Expected: 3 sensors + 50 membranes + class + spike count
+            if len(values) != NUM_SENSORS + NUM_NEURONS + 2:
+                continue
+
+            sensors = values[:3]
+            membranes = np.array(
+                values[3:3 + NUM_NEURONS], dtype=int
+            )
+            input_class = values[3 + NUM_NEURONS]
+            total_spikes = values[4 + NUM_NEURONS]
+
+            # Detect upward threshold crossings.
+            # This assumes membrane values reset after firing.
+            spiked = (
+                (membranes >= THRESHOLD)
+                & (previous_membrane < THRESHOLD)
+            )
+
+            # Store this sample
+            sensor_history.append(sensors)
+            membrane_history.append(membranes.copy())
+            class_history.append(input_class)
+            spike_count_history.append(total_spikes)
+
+            # Neuron numbers are 1 through 50
+            fired_neurons = (
+                np.where(spiked)[0] + 1
+            ).tolist()
+
+            raster_history.append(
+                (sample_number, fired_neurons)
+            )
+
+            previous_membrane = membranes.copy()
+            sample_number += 1
+
+        except (ValueError, UnicodeDecodeError):
+            continue
+
+    if not sensor_history:
+        return
+
+    # Update sensor bars
+    latest_sensors = sensor_history[-1]
+    for bar, value in zip(sensor_bars, latest_sensors):
+        bar.set_height(value)
+
+    # Update membrane heatmap
+    heat_data = np.zeros((NUM_NEURONS, MAX_SAMPLES))
+    history = list(membrane_history)
+
+    for col, membrane in enumerate(history):
+        heat_data[:, col] = membrane
+
+    heat_image.set_data(heat_data)
+    heat_image.set_clim(0, THRESHOLD)
+
+    # Update input class graph
+    classes = list(class_history)
+    x_class = np.arange(len(classes))
+    class_line.set_data(x_class, classes)
+    ax_class.set_xlim(0, max(MAX_SAMPLES - 1, len(classes) - 1))
+
+    # Update cumulative spike graph
+    counts = list(spike_count_history)
+    x_count = np.arange(len(counts))
+    count_line.set_data(x_count, counts)
+    ax_count.set_xlim(0, max(MAX_SAMPLES - 1, len(counts) - 1))
+
+    if counts:
+        ax_count.set_ylim(0, max(10, max(counts) * 1.1))
+
+    # Update spike raster
+    raster_x = []
+    raster_y = []
+
+    for sample, neurons in raster_history:
+        for neuron in neurons:
+            raster_x.append(sample)
+            raster_y.append(neuron)
+
+    if raster_x:
+        raster_points.set_offsets(
+            np.column_stack((raster_x, raster_y))
+        )
+    else:
+        raster_points.set_offsets(np.empty((0, 2)))
+
+    latest_sample = max(0, sample_number - 1)
+    ax_raster.set_xlim(
+        max(0, latest_sample - MAX_SAMPLES + 1),
+        max(MAX_SAMPLES, latest_sample + 1)
+    )
+
+    return (
+        sensor_bars, heat_image, class_line,
+        count_line, raster_points
+    )
+
+# -------- RUN DASHBOARD --------
+ani = animation.FuncAnimation(
+    fig,
+    update,
+    interval=50,
+    blit=False,
+    cache_frame_data=False
+)
+
+plt.tight_layout()
+plt.show()
+
+arduino.close()
